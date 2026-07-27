@@ -17,6 +17,62 @@
 // llama_memory_recurrent
 //
 
+// Can `dev` actually operate on a recurrent-state cache placed in its own memory?
+//
+// The state cache is written by copying into a strided view of a larger tensor (one row
+// per cell). A backend may host the buffer but reject that CPY, and the graph scheduler
+// treats such a pre-allocated tensor as a fatal error rather than falling back:
+//
+//   ggml-backend.cpp: pre-allocated tensor (cache_r_l0 (view) (copy of )) in a buffer
+//   (OPENVINO0) that cannot run the operation (CPY)
+//
+// So probe the device with the same shape of op the cache will need, and let the caller
+// keep the cache on the CPU when the answer is no. Build the probe in a no-alloc context:
+// only the op's metadata is inspected, no data is ever touched.
+static bool llama_recurrent_dev_supports_state_cache(
+        ggml_backend_dev_t dev,
+                 ggml_type type,
+                   int64_t n_embd) {
+    if (n_embd <= 0) {
+        return true;
+    }
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead() * 8 + ggml_graph_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+
+    ggml_context_ptr ctx { ggml_init(params) };
+    if (!ctx) {
+        return true;
+    }
+
+    // Always probe with at least two rows and copy into one of them. The capability under
+    // test is "CPY into a strided window of a larger buffer"; with a single row the view
+    // would cover the whole tensor and a backend that only rejects partial writes would
+    // wrongly look capable.
+    ggml_tensor * cache = ggml_new_tensor_2d(ctx.get(), type, n_embd, 2);
+    if (!cache) {
+        return true;
+    }
+    ggml_format_name(cache, "cache_probe");
+
+    // a single-row destination view, i.e. a strided window into a larger buffer
+    ggml_tensor * dst = ggml_view_2d(ctx.get(), cache, n_embd, 1, cache->nb[1], 0);
+    ggml_tensor * src = ggml_new_tensor_2d(ctx.get(), type, n_embd, 1);
+    if (!dst || !src) {
+        return true;
+    }
+
+    ggml_tensor * cpy = ggml_cpy(ctx.get(), src, dst);
+    if (!cpy) {
+        return true;
+    }
+
+    return ggml_backend_dev_supports_op(dev, cpy);
+}
+
 llama_memory_recurrent::llama_memory_recurrent(
         const llama_model & model,
                 ggml_type   type_r,
@@ -82,11 +138,22 @@ llama_memory_recurrent::llama_memory_recurrent(
 
         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
 
+        const uint32_t n_rows = mem_size * (1 + n_rs_seq);
+
         if (offload) {
             auto * dev = model.dev_layer(i);
-            buft = ggml_backend_dev_buffer_type(dev);
 
-            dev_name = ggml_backend_dev_name(dev);
+            // Only offload the state cache if the device can also update it in place;
+            // otherwise the scheduler would abort on the first CPY into a cache view.
+            if (llama_recurrent_dev_supports_state_cache(dev, type_r, hparams.n_embd_r()) &&
+                llama_recurrent_dev_supports_state_cache(dev, type_s, hparams.n_embd_s())) {
+                buft = ggml_backend_dev_buffer_type(dev);
+
+                dev_name = ggml_backend_dev_name(dev);
+            } else {
+                LLAMA_LOG_DEBUG("%s: layer %3d: %s cannot update a recurrent state cache in place, "
+                                "keeping it on the CPU\n", __func__, i, ggml_backend_dev_name(dev));
+            }
         }
 
         LLAMA_LOG_DEBUG("%s, layer %3d: dev = %s\n", __func__, i, dev_name);
@@ -96,7 +163,6 @@ llama_memory_recurrent::llama_memory_recurrent(
             throw std::runtime_error("failed to create ggml context for rs cache");
         }
 
-        const uint32_t n_rows = mem_size * (1 + n_rs_seq);
         ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
         ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows);
         ggml_format_name(r, "cache_r_l%d", i);
