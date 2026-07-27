@@ -66,6 +66,10 @@ struct ggml_openvino_device_config {
     ov::AnyMap compile_config;
     std::unordered_map<std::string, std::string> environment_variables;
     cl_command_queue cl_queue = nullptr;
+    // Platform owning the device behind cl_queue. The USM extension entry points must be
+    // resolved against this platform, not against platform 0, which may be a different
+    // driver altogether (e.g. rusticl on a Mesa system).
+    cl_platform_id cl_platform = nullptr;
 
     void init();
     ~ggml_openvino_device_config();

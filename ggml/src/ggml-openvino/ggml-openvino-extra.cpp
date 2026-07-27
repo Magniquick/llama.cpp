@@ -9,6 +9,7 @@
 #include <openvino/runtime/intel_npu/level_zero/level_zero.hpp>
 #include <openvino/runtime/properties.hpp>
 #include <optional>
+#include <vector>
 
 ov::Core & ov_singleton_core() {
     static ov::Core core;
@@ -86,20 +87,102 @@ void ggml_openvino_device_config::init() {
 
     // Initialize remote context with queue sharing for GPU
     if (device_name == "GPU") {
-        // Create OpenCL context and queue
+        // Create OpenCL context and queue.
+        //
+        // Pick the device by capability rather than taking platform 0: the ICD loader
+        // enumerates every installed driver, and a non-Intel one may come first. On a
+        // Mesa system rusticl advertises the same iGPU as a GPU device, but its program
+        // binaries are not the format the OpenVINO GPU plugin expects, so handing it an
+        // rusticl-backed context makes compile_model throw
+        //   "Incompatible OpenCL runtime: program is not in expected ELF format".
+        //
+        // Select on cl_intel_unified_shared_memory rather than on CL_DEVICE_VENDOR_ID or
+        // the platform name: this backend needs USM anyway (see
+        // ggml_openvino_get_clEnqueueMemcpyINTEL), so it is the capability that actually
+        // matters. Vendor ID does NOT discriminate here - rusticl reports the true PCI
+        // vendor 0x8086 for an Intel iGPU, so matching on it still selects rusticl.
         cl_int err;
-        cl_platform_id platform;
-        err = clGetPlatformIDs(1, &platform, nullptr);
-        if (err != CL_SUCCESS) {
-            GGML_LOG_ERROR("Failed to get OpenCL platform: %d\n", err);
+        cl_uint num_platforms = 0;
+        err = clGetPlatformIDs(0, nullptr, &num_platforms);
+        if (err != CL_SUCCESS || num_platforms == 0) {
+            GGML_LOG_ERROR("Failed to get OpenCL platform count: %d\n", err);
             return;
         }
 
-        cl_device_id cl_device;
-        err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 1, &cl_device, nullptr);
+        std::vector<cl_platform_id> platforms(num_platforms);
+        err = clGetPlatformIDs(num_platforms, platforms.data(), nullptr);
         if (err != CL_SUCCESS) {
-            GGML_LOG_ERROR("Failed to get OpenCL device: %d\n", err);
+            GGML_LOG_ERROR("Failed to get OpenCL platforms: %d\n", err);
             return;
+        }
+
+        cl_device_id cl_device = nullptr;
+        cl_device_id fallback_device = nullptr;
+
+        for (cl_platform_id platform : platforms) {
+            cl_uint num_devices = 0;
+            if (clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 0, nullptr, &num_devices) != CL_SUCCESS ||
+                num_devices == 0) {
+                continue;
+            }
+
+            std::vector<cl_device_id> devices(num_devices);
+            if (clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, num_devices, devices.data(), nullptr) != CL_SUCCESS) {
+                continue;
+            }
+
+            for (cl_device_id device : devices) {
+                if (fallback_device == nullptr) {
+                    fallback_device = device;
+                }
+
+                size_t ext_size = 0;
+                if (clGetDeviceInfo(device, CL_DEVICE_EXTENSIONS, 0, nullptr, &ext_size) != CL_SUCCESS ||
+                    ext_size == 0) {
+                    continue;
+                }
+                std::vector<char> extensions(ext_size);
+                if (clGetDeviceInfo(device, CL_DEVICE_EXTENSIONS, ext_size, extensions.data(), nullptr) !=
+                    CL_SUCCESS) {
+                    continue;
+                }
+                if (strstr(extensions.data(), "cl_intel_unified_shared_memory") != nullptr) {
+                    cl_device = device;
+                    break;
+                }
+            }
+            if (cl_device != nullptr) {
+                break;
+            }
+        }
+
+        if (cl_device == nullptr) {
+            // Nothing exposes Intel USM. Keep the previous behaviour rather than failing
+            // outright, but say so, because a mismatched context usually fails at compile time.
+            if (fallback_device == nullptr) {
+                GGML_LOG_ERROR("Failed to find any OpenCL GPU device\n");
+                return;
+            }
+            GGML_LOG_WARN("GGML OpenVINO Backend: no OpenCL GPU device supports Intel USM, "
+                          "falling back to the first GPU device\n");
+            cl_device = fallback_device;
+        }
+
+        cl_platform = nullptr;
+        if (clGetDeviceInfo(cl_device, CL_DEVICE_PLATFORM, sizeof(cl_platform), static_cast<void *>(&cl_platform),
+                            nullptr) != CL_SUCCESS) {
+            cl_platform = nullptr;
+        }
+
+        {
+            char dev_name[256]  = "(unknown)";
+            char plat_name[256] = "(unknown)";
+            clGetDeviceInfo(cl_device, CL_DEVICE_NAME, sizeof(dev_name), dev_name, nullptr);
+            if (cl_platform != nullptr) {
+                clGetPlatformInfo(cl_platform, CL_PLATFORM_NAME, sizeof(plat_name), plat_name, nullptr);
+            }
+            GGML_LOG_INFO("GGML OpenVINO Backend: using OpenCL platform '%s', device '%s' (of %u platform(s))\n",
+                          plat_name, dev_name, num_platforms);
         }
 
         cl_context cl_ctx = clCreateContext(nullptr, 1, &cl_device, nullptr, nullptr, &err);
@@ -194,8 +277,8 @@ clEnqueueMemFillINTEL_fn ggml_openvino_get_clEnqueueMemFillINTEL() {
     static bool loaded = false;
     if (!loaded) {
         loaded = true;
-        cl_platform_id platform;
-        if (clGetPlatformIDs(1, &platform, nullptr) == CL_SUCCESS) {
+        cl_platform_id platform = ggml_openvino_get_device_config().cl_platform;
+        if (platform != nullptr) {
             fn = (clEnqueueMemFillINTEL_fn) clGetExtensionFunctionAddressForPlatform(platform, "clEnqueueMemFillINTEL");
         }
     }
@@ -208,8 +291,8 @@ clEnqueueMemcpyINTEL_fn ggml_openvino_get_clEnqueueMemcpyINTEL() {
     static bool loaded = false;
     if (!loaded) {
         loaded = true;
-        cl_platform_id platform;
-        if (clGetPlatformIDs(1, &platform, nullptr) == CL_SUCCESS) {
+        cl_platform_id platform = ggml_openvino_get_device_config().cl_platform;
+        if (platform != nullptr) {
             fn = (clEnqueueMemcpyINTEL_fn) clGetExtensionFunctionAddressForPlatform(platform, "clEnqueueMemcpyINTEL");
         }
     }
