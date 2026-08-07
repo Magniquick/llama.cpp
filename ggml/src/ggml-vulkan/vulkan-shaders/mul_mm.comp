@@ -312,7 +312,19 @@ void main() {
             }
         }
 #else
+        // Keep this outer loop rolled for MUL_MAT_ID (MoE). Its body already contains
+        // fully-unrolled WMITER x TM and WNITER x TN loops, and the MUL_MAT_ID variant
+        // additionally keeps row-id gather addressing live across it. On Intel anv/brw an
+        // explicit unroll request bypasses the cost heuristic entirely, so unrolling all
+        // 16 quantized iterations produces a 111,793-instruction kernel with 5,908 spills
+        // that trips an engine reset (VK_ERROR_DEVICE_LOST) on Arrow Lake / Arc 140T.
+        // Kept rolled it is 5,990 instructions with 68 spills and completes in ms.
+        // Scoped to MUL_MAT_ID because rolling it unconditionally costs non-MoE shapes.
+#ifdef MUL_MAT_ID
+        [[dont_unroll]] for (uint i = 0; i < BK / BK_STEP; i++) {
+#else
         [[unroll]] for (uint i = 0; i < BK / BK_STEP; i++) {
+#endif
             // Load from shared into cache
             [[unroll]] for (uint wsir = 0; wsir < WMITER; wsir++) {
                 [[unroll]] for (uint j = 0; j < TM; j++) {

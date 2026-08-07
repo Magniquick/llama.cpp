@@ -18788,6 +18788,17 @@ static bool ggml_vk_device_is_supported(const vk::PhysicalDevice & vkdev) {
 static bool ggml_vk_khr_cooperative_matrix_support(const vk::PhysicalDeviceProperties& props, const vk::PhysicalDeviceDriverProperties& driver_props, vk_device_architecture arch) {
     switch (props.vendorID) {
     case VK_VENDOR_ID_INTEL:
+        // Integrated Xe (Xe-LPG/Xe-LPG+, e.g. Arrow Lake Arc 140T) satisfies every
+        // condition below except the driver ID: the allowlist only trusts the Windows
+        // proprietary driver, so coopmat is off under Mesa even though Mesa advertises
+        // VK_KHR_cooperative_matrix, cooperativeMatrix=true and the hardware has XMX.
+        // Opt in with GGML_VK_ENABLE_INTEL_COOPMAT=1 to test whether it actually helps
+        // here; left off by default because upstream saw regressions on older parts.
+        if (getenv("GGML_VK_ENABLE_INTEL_COOPMAT") &&
+            (arch == vk_device_architecture::INTEL_XE1 || arch == vk_device_architecture::INTEL_XE2) &&
+            props.deviceType == vk::PhysicalDeviceType::eIntegratedGpu) {
+            return true;
+        }
         // Only allowing Xe2/Xe3 GPU and integrated Xe GPUs at the moment since older hardware (ex. Arc A770) has performance regressions.
         return (arch == vk_device_architecture::INTEL_XE2) ||
             (arch == vk_device_architecture::INTEL_XE1 && props.deviceType == vk::PhysicalDeviceType::eIntegratedGpu && driver_props.driverID == vk::DriverId::eIntelProprietaryWindows);
