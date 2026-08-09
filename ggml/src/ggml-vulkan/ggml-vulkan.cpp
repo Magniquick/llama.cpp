@@ -386,7 +386,7 @@ class vk_perf_logger;
 static void ggml_vk_destroy_buffer(vk_buffer& buf);
 static void ggml_vk_synchronize(ggml_backend_vk_context * ctx);
 
-static constexpr uint32_t mul_mat_vec_max_cols = 8;
+static constexpr uint32_t mul_mat_vec_max_cols = 16;
 static constexpr uint32_t p021_max_gqa_ratio = 8;
 
 enum vk_device_architecture {
@@ -7801,6 +7801,14 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
                 dmmv_wg = DMMV_WG_SIZE_LARGE;
             }
         }
+    }
+
+    // Shared memory for the reduction is tmpsh[NUM_COLS][NUM_ROWS][BLOCK_SIZE], so it
+    // grows linearly with num_cols and eats occupancy on devices with a small SLM budget.
+    // The SUBGROUP variant reduces entirely in subgroup ops and allocates none, so prefer
+    // it once the column count is wide enough for that to dominate.
+    if (num_cols >= 4) {
+        dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
     }
 
     if (b_type == GGML_TYPE_Q8_1) {
